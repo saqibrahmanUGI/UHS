@@ -1,0 +1,324 @@
+---
+title: "Statistical process charts for monitoring outcomes"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+This document describes the setup and derivation of statistical process monitoring charts (EWMA and CUSUM) for binary outcome events in the context of an unsupervised automatically updated datset. It is expected that this framework could be applied to all surgical procedures currently recorded in HICCS or identified with other methods, when data on specific outcomes (that can be automatically extracted) +/- clinical data is available.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+clindata <- readRDS("~/Desktop/Supervisees/Anna Broadbent/clindata.rds")
+clindata$Anastomotic.Leak<-as.numeric(clindata$Anastomotic.Leak)-1
+clindata$majcomp<-as.numeric(clindata$majcomp)-1
+clindata$returntotheatre<-as.numeric(clindata$returntotheatre)-1
+clindata$Complications<-as.numeric(clindata$Complications)-1
+clindata$Change.in.Level.of.care<-as.numeric(clindata$Change.in.Level.of.care)-1
+```
+
+## Setup
+
+A dataset for a given procedure is generated, containing each patient for which that procedure was conducted, a set of basic patient demographics/clinical factors which are reliably recorded and outcome measures of choice. Reliable outcome measures could include mortality (e.g. 30-day/90-day postoperative mortality), 30-day readmission, 30-day return to theatre, escalation of care (going to HDU/ITU). Further outcomes including complications, resection margins and speciality specific outcomes may be extractable in future iterations.
+
+This dataset is then split to analyse the most recent cases in comparison to historic cases. This may be best achieved by date (e.g. including the last 6-12 months of cases). 
+
+Here I have generated a dataset of patients undergoing Oesophagectomy 2010-present. We analyse the most recent 50 cases in comparison to those preceding. Expected performance can be benchmarked to previous performance (if national/research specific figures exist they can replace the automatically generated benchmark). For this example I have selected change in level of care (i.e. unplanned HDU/ITU admission) as the outcome, which is stored as a numerical vector coded as 0 for absence and 1 for presence of the outcome. The outcome occurs in 14.1% of the benchmarking cohort and 15.7% of the analysis cohort.
+
+
+```{r bench}
+benchmarkDF<-clindata[1:(nrow(clindata)-50),]
+analysisDF<-clindata[(nrow(clindata)-50):nrow(clindata),]
+
+##Choose  variable for analysis - here i have chosen unplanned admission to critical care
+benchoutcome<-benchmarkDF$Change.in.Level.of.care
+analysisoutcome<-analysisDF$Change.in.Level.of.care
+
+##benchmark and record previous performance
+benchmark<-mean(benchoutcome)
+
+mean(benchoutcome)
+mean(analysisoutcome)
+
+```
+
+## Exponentially weighted moving average (EWMA)
+
+The EWMA is a weighted moving average of outcome proportion which is updated with each additional observation. An exponential weight is applied, meaning that more recent cases are considered more important than those conducted longer ago. Its key benefit over CUSUM is that it generates a proportion/percentage which is readily intepretible, in comparison to the CUSUM which generates an arbitrary chart statistic.
+
+Derivation requires setting:
+
+1) the exponential weighting factor (lambda) - higher values will detect problems earlier, but increase the risk of false negative. Should not be higher than 0.1, somewhere between 0.01 and 0.1 is probably most appropriate.
+
+2) the control/alert limit width (L) - how far above the benchmark concern should be taken. This is generally around 2 standard errors, for interpretability it is set here to 1.95996 standard errors (i.e. the 95% confidence interval)
+
+A universal approach in the initial phase is reasonable, which may be modified in individual situations as the project evolves. From those figures and the benchmark and the outcome for analysis, control limits are set and the EWMA trace generated.
+  
+
+```{r EWMA}
+
+lambda<-0.1
+L<-1.95996
+
+##establish control limits
+llim = benchmark - L*sqrt((benchmark)*(1-benchmark)*(lambda/(2-lambda)))
+ulim = benchmark +  L*sqrt((benchmark)*(1-benchmark)*(lambda/(2-lambda)))
+
+##create trace
+x = benchmark
+EWMA = rep(benchmark,length(analysisoutcome))
+for (i in 1:length(analysisoutcome)) {
+  EWMA[i] = (1-lambda)*x + lambda*analysisoutcome[i]
+  x = EWMA[i]
+}
+
+###a vector of the sequential weighted proportions is created
+EWMA
+
+```
+
+It is then straightforward to plot this trace in either standard:
+
+
+```{r EWMAPlot}
+plot(EWMA~c(1:length(EWMA)),xlab = "patient number", type = "l", ylab = "Proportion ", 
+     axes = F, ylim = c(min(EWMA)-0.1,max(EWMA)+0.1))
+axis(side = 2, at = seq(round(min(EWMA)-0.1,1),round(max(EWMA)+0.1,1),0.05),  
+     las = 2, cex = 1.5)
+axis(side = 1, at = seq(1,length(analysisoutcome),10))
+abline(h = llim, col = "green")
+abline(h=0,col='black')
+abline(h = ulim, col = "red")
+abline(h = benchmark,col='blue')
+title("EWMA")
+```
+
+Or complex plotting forms.
+
+
+```{r EWMAPlotly}
+library(plotly)
+EWMAplot<-plot_ly(x=1:nrow(analysisDF),y=EWMA*100, type="scatter", mode="lines", 
+                  name="Weighted Average")%>% 
+  layout(legend=list(orientation='h'),title="EWMA Chart",xaxis=list(title = ""),
+         yaxis=list(title = "Weighted percentage", hoverformat='.1f',
+                    range=c(0,ifelse((ulim>max(EWMA)),((ulim*1.1)*100),
+                                     (max(EWMA*1.25)*100)))))%>%
+  add_trace(x=c(1:length(EWMA)), y=ulim*100, type="scatter", mode="lines", 
+            color=I("red"),name="Alert Line")%>%
+  add_trace(x=c(1:length(EWMA)), y=benchmark*100, type="scatter", mode="lines", 
+            color=I("green"),name="Overall Average")%>%
+  plotly::config(displayModeBar=FALSE)%>%
+  layout(margin = list(b=100),annotations = 
+           list(x = 1, y = -0.3, text = paste('Escalation of Care'), 
+                showarrow = F, xref='paper', yref='paper', 
+                xanchor='right', yanchor='auto', xshift=0, yshift=0.5
+           ))
+
+EWMAplot
+```
+
+## Cumulative Sum (CUSUM) chart
+
+This is a similar technique based on the log-likelihood ratio. It lacks direct interpretability compared to the EWMA and by convetion it also resets after any alarm signal is generated. It is probably more sensitive however.
+
+Here we need to set two parameters:
+
+1) Odds ratio (OR): the expected odds ratio of an out of control process (i.e. how much the risk is increased if there is a problem). Larger values allow the chart to alarm earlier. 2 is a reasonable starting choice
+
+2) The limit height (limit), typically from 1 to 5, with lower allowing an earlier alarm but increased false positive. Again, 2 is a reasonable starting point.
+
+We then can calculate the trace in a similar fashion, allowing it to reset to 0 if the limit is breached.
+
+```{r CUSUM}
+  ##set target
+  OR<-2
+  ##set limit
+  limit<-2
+  
+  z = analysisoutcome
+
+  s=(z*(log(OR)-log(1+benchmark*(OR-1)))) -((1-z)*log(1+benchmark*(OR-1)))
+  
+  CUSUM = rep(NA,length(z))
+  x = 0
+  
+  for (i in 1:length(z)) {
+    CUSUM[i] = ifelse(x + s[i]<0,0,x+s[i])
+    CUSUM[i] = ifelse(x + s[i]>=limit,0,CUSUM[i])
+    x = CUSUM[i]
+  }
+  
+  CUSUM
+```
+
+Similar simple/complex plots can  then be generated
+
+```{r CUSUM Plotly}
+
+  plot(CUSUM~c(1:length(CUSUM)),xlab = "patient number", type = "l", 
+       ylab = "Chart Statistic ", axes = F, 
+       ylim = c(min(CUSUM)-0.1,ifelse(max(CUSUM)>limit,max(CUSUM)+0.1,limit+0.1)))
+  axis(side = 2, at = seq(round(min(CUSUM)-0.1,1),round(ifelse(max(CUSUM)>limit,
+      max(CUSUM)+0.1,limit+0.1),1),0.2),  las = 2, cex = 1.5)
+  axis(side = 1, at = seq(1,length(analysisoutcome),10))
+  abline(h=0,col='black')
+  abline(h = limit, col = "red")
+  abline(h = benchmark,col='blue')
+  title("CUSUM")
+  
+
+
+ library(plotly)
+  CUSUMplot<-plot_ly(x=1:nrow(analysisDF),y=CUSUM, type="scatter", mode="lines", 
+                     name="Trace")%>% 
+    layout(legend=list(orientation='h'),title="CUSUM Chart",xaxis=list(title = ""),
+           yaxis=list(title = "Chart Statistic",hoverformat='.1f',
+                      range=c(0,ifelse((limit>max(CUSUM)),((limit*1.1)),
+                                       (max(CUSUM*1.25))))))%>%
+    add_trace(x=c(1:length(CUSUM)), y=limit, type="scatter", mode="lines", 
+              color=I("red"),name="Alert Line")%>%
+    add_trace(x=c(1:length(CUSUM)), y=benchmark, type="scatter", mode="lines", 
+              color=I("green"),name="Overall Average")%>%plotly::config(displayModeBar=FALSE)%>%
+    layout(margin = list(b=100),annotations = 
+             list(x = 1, y = -0.3, text = paste('Escalation of Care'), 
+                  showarrow = F, xref='paper', yref='paper', 
+                  xanchor='right', yanchor='auto', xshift=0, yshift=0.5
+             ))
+  CUSUMplot
+```
+
+##Risk Adjustment
+
+#Both the EWMA and CUSUM can be 'risk adjusted', requiring the derivation of a logistic regression model, with the outcome in question as the dependent variable and selected covariates (with available data) as predictor variables and the benchmarking data as the data to derive the model. This will allow for cases in the analysis dataset to be  adjusted for their respective covariates. 
+
+
+```{r riskadjustment}
+#select relevant variables
+covariates<-colnames(benchmarkDF)[c(1,2,5,10,11,12,18)]
+covariates
+
+#train model, here using the base r function glm
+model <- glm(as.formula(paste('Change.in.Level.of.care','~',paste(covariates,collapse='+'))),data= benchmarkDF,family  = binomial)
+
+#'predict' on the analysisDF cases
+preds<-predict(model,analysisDF,type='response')
+
+#giving predicted probability of outcome based on the covariates listed in the covariates vector.
+preds
+```
+
+We can then replace the benchmarking figure as a baseline for the predicted probability in either the EWMA or CUSUM, yielding a risk  adjusted plot.
+
+```{r RAEWMA}
+########### Risk-Adjusted EWMA 
+
+{
+  #specify exponential weighting factor - higher values will detect problems earlier, but
+  #increased risk of false negative. Should not be higher than 0.1, somewhere between 0.01
+  #and 0.1 is probably most appropriate
+  lambda<-0.1
+  #set control limit at above 95% confidence interval
+  L<-1.95996
+  
+  ##establish control limits
+  llim = benchmark - L*sqrt((benchmark)*(1-benchmark)*(lambda/(2-lambda)))
+  ulim = benchmark +  L*sqrt((benchmark)*(1-benchmark)*(lambda/(2-lambda)))
+  
+  ##create trace
+  x = benchmark
+  EWMA = rep(benchmark,length(analysisoutcome))
+  for (i in 1:length(analysisoutcome)) {
+    EWMA[i] = (1-lambda)*preds[i] + lambda*analysisoutcome[i]
+    x = EWMA[i]
+  }
+  
+  ###a vector of the sequential weighted proportions is created
+  EWMA
+  ###########################################################################
+  ###we can then convert that into a readily interpretible plot
+  ######plot trace (base R)
+  
+  #plot trace (plotly package)
+  library(plotly)
+  RAEWMAplot<-plot_ly(x=1:nrow(analysisDF),y=EWMA*100, type="scatter", mode="lines", 
+                  name="Weighted Average")%>% 
+  layout(legend=list(orientation='h'),title="Risk-Adjusted EWMA Chart",xaxis=list(title = ""),
+         yaxis=list(title = "Weighted percentage", hoverformat='.1f',
+                    range=c(0,ifelse((ulim>max(EWMA)),((ulim*1.1)*100),
+                                     (max(EWMA*1.25)*100)))))%>%
+  add_trace(x=c(1:length(EWMA)), y=ulim*100, type="scatter", mode="lines", 
+            color=I("red"),name="Alert Line")%>%
+  add_trace(x=c(1:length(EWMA)), y=benchmark*100, type="scatter", mode="lines", 
+            color=I("green"),name="Overall Average")%>%
+  plotly::config(displayModeBar=FALSE)%>%
+  layout(margin = list(b=100),annotations = 
+           list(x = 1, y = -0.3, text = paste('Escalation of Care'), 
+                showarrow = F, xref='paper', yref='paper', 
+                xanchor='right', yanchor='auto', xshift=0, yshift=0.5
+           ))
+  
+}
+
+RAEWMAplot
+EWMAplot
+```
+
+
+
+```{r RACUSUM}
+{
+  #Combinations of odds ratio of negative effect and tolerability set to 
+  #calculated risk of false positive using Markov-chain monte carlo simulation
+  
+  ##set target
+  OR<-2
+  ##set limit
+  limit<-2
+  
+  z = analysisoutcome
+  
+  ###s=(z*(log(OR)-log(1+benchmark*(OR-1)))) -((1-z)*log(1+benchmark*(OR-1)))
+  ###change benchmark vector to predicted probability for each case
+  s<-(z*(log(OR)-log(1+preds*(OR-1)))) -((1-z)*log(1+preds*(OR-1)))
+
+  
+  
+  CUSUM = rep(NA,length(z))
+  x = 0
+  
+  for (i in 1:length(z)) {
+    CUSUM[i] = ifelse(x + s[i]<0,0,x+s[i])
+    CUSUM[i] = ifelse(x + s[i]>=limit,0,CUSUM[i])
+    x = CUSUM[i]
+  }
+  
+  CUSUM
+
+  
+  #plot trace (plotly package)
+  library(plotly)
+  RACUSUMplot<-plot_ly(x=1:nrow(analysisDF),y=CUSUM, type="scatter", mode="lines", 
+                     name="Trace")%>% 
+    layout(legend=list(orientation='h'),title="Risk-Adjusted CUSUM Chart",xaxis=list(title = ""),
+           yaxis=list(title = "Chart Statistic",hoverformat='.1f',
+                      range=c(0,ifelse((limit>max(CUSUM)),((limit*1.1)),
+                                       (max(CUSUM*1.25))))))%>%
+    add_trace(x=c(1:length(CUSUM)), y=limit, type="scatter", mode="lines", 
+              color=I("red"),name="Alert Line")%>%
+    add_trace(x=c(1:length(CUSUM)), y=benchmark, type="scatter", mode="lines", 
+              color=I("green"),name="Overall Average")%>%plotly::config(displayModeBar=FALSE)%>%
+    layout(margin = list(b=100),annotations = 
+             list(x = 1, y = -0.3, text = paste('Escalation of Care'), 
+                  showarrow = F, xref='paper', yref='paper', 
+                  xanchor='right', yanchor='auto', xshift=0, yshift=0.5
+             ))
+  
+}
+
+CUSUMplot
+RACUSUMplot
+```
+
+
